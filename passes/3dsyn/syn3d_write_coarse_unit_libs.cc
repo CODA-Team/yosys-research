@@ -1347,10 +1347,12 @@ class NetlistTimingAnalyzer
 
                 SignalDriver driver;
                 std::set<YosysJsonToolkit::Bit> seen_inputs;
+                bool has_input_port = false;
                 for (const auto &input_dir_entry : cell.port_directions) {
                     const std::string &input_port = input_dir_entry.first;
                     if (input_dir_entry.second != "input")
                         continue;
+                    has_input_port = true;
 
                     auto rel_conn_it = cell.connections.find(input_port);
                     if (rel_conn_it == cell.connections.end()) {
@@ -1374,7 +1376,7 @@ class NetlistTimingAnalyzer
                     driver.deps.push_back(SignalDependency{dep_sig});
                 }
 
-                if (driver.deps.empty()) {
+                if (driver.deps.empty() && has_input_port) {
                     log_error("syn3d_write_coarse_unit_libs: output %s of cell %s (%s) in %s has no non-constant timing dependency\n",
                               output_port.c_str(), cell.name.c_str(), cell.type.c_str(), context_.c_str());
                 }
@@ -1986,22 +1988,11 @@ struct Syn3dWriteCoarseUnitLibsPass : Pass {
         f << "    }\n";
     }
 
-    void write_lib(const std::string &path,
-                   const std::string &library_name,
-                   const std::string &cell_name,
-                   Module *mod,
-                   const SequentialCellModel &seq_model,
-                   double area,
-                   const PassConfig &cfg,
-                   const TimingModel *comb_model)
+    void emit_library_preamble(std::ofstream &f,
+                               const std::string &library_name,
+                               const PassConfig &cfg,
+                               const std::set<int> &bus_widths)
     {
-        std::ofstream f(path);
-        if (f.is_open() == false)
-            log_error("syn3d_write_coarse_unit_libs: cannot open %s\n", path.c_str());
-
-        std::vector<PortInfo> input_ports, output_ports;
-        std::set<int> bus_widths;
-        collect_port_lists(mod, input_ports, output_ports, bus_widths);
         const GenericLibParams &p = cfg.generic_lib;
         const ReferenceTableSet &ref_tables = lookup_reference_table_set(cfg);
         const LibraryThresholdParams &thresholds = ref_tables.thresholds;
@@ -2065,6 +2056,20 @@ struct Syn3dWriteCoarseUnitLibsPass : Pass {
         }
 
         emit_library_templates(f, ref_tables);
+    }
+
+    void emit_library_cell(std::ofstream &f,
+                           const std::string &cell_name,
+                           Module *mod,
+                           const SequentialCellModel &seq_model,
+                           double area,
+                           const PassConfig &cfg,
+                           const TimingModel *comb_model)
+    {
+        std::vector<PortInfo> input_ports, output_ports;
+        std::set<int> unused_bus_widths;
+        collect_port_lists(mod, input_ports, output_ports, unused_bus_widths);
+        const ReferenceTableSet &ref_tables = lookup_reference_table_set(cfg);
 
         f << "  cell(" << cell_name << ") {\n";
         f << "    area : " << area << ";\n";
@@ -2077,6 +2082,26 @@ struct Syn3dWriteCoarseUnitLibsPass : Pass {
             emit_output_pin(f, op, seq_model, comb_model, ref_tables);
 
         f << "  }\n\n";
+    }
+
+    void write_lib(const std::string &path,
+                   const std::string &library_name,
+                   const std::string &cell_name,
+                   Module *mod,
+                   const SequentialCellModel &seq_model,
+                   double area,
+                   const PassConfig &cfg,
+                   const TimingModel *comb_model)
+    {
+        std::ofstream f(path);
+        if (f.is_open() == false)
+            log_error("syn3d_write_coarse_unit_libs: cannot open %s\n", path.c_str());
+
+        std::vector<PortInfo> input_ports, output_ports;
+        std::set<int> bus_widths;
+        collect_port_lists(mod, input_ports, output_ports, bus_widths);
+        emit_library_preamble(f, library_name, cfg, bus_widths);
+        emit_library_cell(f, cell_name, mod, seq_model, area, cfg, comb_model);
         f << "}\n";
     }
 
@@ -2111,6 +2136,23 @@ struct Syn3dWriteCoarseUnitLibsPass : Pass {
             if (system(("mkdir -p \"" + dir + "\"").c_str()) != 0)
                 log_error("syn3d_write_coarse_unit_libs: cannot create directory %s\n", dir.c_str());
         }
+
+        std::set<int> aggregate_2d_bus_widths;
+        for (auto mod : d->modules()) {
+            if (mod->get_bool_attribute(ID(syn3d_coarse_unit)) == false)
+                continue;
+            std::vector<PortInfo> input_ports, output_ports;
+            std::set<int> module_bus_widths;
+            collect_port_lists(mod, input_ports, output_ports, module_bus_widths);
+            aggregate_2d_bus_widths.insert(module_bus_widths.begin(), module_bus_widths.end());
+        }
+
+        std::string aggregate_2d_lib_path = lib_2d_dir + "/coarse_units.lib";
+        std::ofstream aggregate_2d_lib(aggregate_2d_lib_path);
+        if (aggregate_2d_lib.is_open() == false)
+            log_error("syn3d_write_coarse_unit_libs: cannot open %s\n", aggregate_2d_lib_path.c_str());
+        emit_library_preamble(aggregate_2d_lib, "coarse_units__2d",
+                              bottom_cfg, aggregate_2d_bus_widths);
 
         int total = 0;
         long long total_calc_ms = 0;
@@ -2184,6 +2226,8 @@ struct Syn3dWriteCoarseUnitLibsPass : Pass {
                       macro_name + "__2d",
                       macro_name, mod, seq_model, bottom_area, bottom_cfg,
                       bottom_comb_model.get());
+            emit_library_cell(aggregate_2d_lib, macro_name, mod, seq_model,
+                              bottom_area, bottom_cfg, bottom_comb_model.get());
             write_lib(lib_bottom_dir + "/" + macro_name + ".bottom.lib",
                       macro_name + "__bottom",
                       macro_name + "_bottom", mod, seq_model, bottom_area, bottom_cfg,
@@ -2195,8 +2239,15 @@ struct Syn3dWriteCoarseUnitLibsPass : Pass {
             total++;
         }
 
+        aggregate_2d_lib << "}\n";
+        aggregate_2d_lib.close();
+        if (aggregate_2d_lib.fail())
+            log_error("syn3d_write_coarse_unit_libs: failed to write %s\n",
+                      aggregate_2d_lib_path.c_str());
+
         log_header(d, "syn3d_write_coarse_unit_libs: %d coarse-unit types written in three views\n",
                    total);
+        log("  aggregate 2D LIB : %s\n", aggregate_2d_lib_path.c_str());
         log("  2D LIB dir : %s\n", lib_2d_dir.c_str());
         log("  bottom LIB dir : %s\n", lib_bottom_dir.c_str());
         log("  upper LIB dir : %s\n", lib_upper_dir.c_str());

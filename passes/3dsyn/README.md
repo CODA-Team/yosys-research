@@ -134,16 +134,20 @@ It produces:
 
 ```text
 SYN3D_HANDOFF_DIR/lib/
-├── 2d/<coarse-unit-type>.lib
+├── 2d/
+│   ├── coarse_units.lib
+│   └── <coarse-unit-type>.lib
 ├── bottom/<coarse-unit-type>.bottom.lib
 └── upper/<coarse-unit-type>.upper.lib
 ```
 
 The 2D view uses the bottom-tier implementation and retains the unsuffixed
 coarse-unit type name used by the coarse netlist. Tier-specific cell names use
-the `_bottom` and `_upper` suffixes. The command also writes read-back topology
-files under `SYN3D_HANDOFF_DIR/lib_topology`; these are diagnostic work products,
-not downstream flow inputs.
+the `_bottom` and `_upper` suffixes. `coarse_units.lib` combines all unsuffixed
+2D cells under one library header and is the coarse-partition handoff; the
+per-unit 2D files remain available for inspection. The command also writes
+read-back topology files under `SYN3D_HANDOFF_DIR/lib_topology`; these are
+diagnostic work products, not downstream flow inputs.
 
 ## Terminology
 
